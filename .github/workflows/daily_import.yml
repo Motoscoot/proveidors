@@ -1,0 +1,63 @@
+name: daily-import
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install requirements
+        run: pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Download catalog from Supabase Storage
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CATALOG_OBJECT: ${{ secrets.CATALOG_OBJECT }}
+        run: |
+          mkdir -p /tmp/catalog
+          echo "Downloading object: ${CATALOG_OBJECT}"
+          curl -s -H "Authorization: Bearer ${SUPABASE_KEY}" -H "apikey: ${SUPABASE_KEY}" \
+            "${SUPABASE_URL}/storage/v1/object/${CATALOG_OBJECT}" -o /tmp/catalog/catalog.zip
+          if [ ! -s /tmp/catalog/catalog.zip ]; then
+            echo "Download failed or empty file"; exit 1
+          fi
+          unzip -p /tmp/catalog/catalog.zip > /tmp/catalog/catalog_inner.json || {
+            unzip /tmp/catalog/catalog.zip -d /tmp/catalog
+            inner=$(find /tmp/catalog -type f -name '*.json' | head -n1)
+            if [ -z "$inner" ]; then echo "No inner JSON found"; exit 1; fi
+            mv "$inner" /tmp/catalog/catalog_inner.json
+          }
+
+      - name: Show sample
+        run: head -n 20 /tmp/catalog/catalog_inner.json || true
+
+      - name: Run import worker
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LOCAL_JSON_PATH: /tmp/catalog/catalog_inner.json
+          SUPPLIER_NAME: "BIHR"
+        run: |
+          python3 workers/import_replace.py
+
+      - name: Verify counts (optional)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          echo "supplier_sku count:"
+          curl -s -H "apikey: ${SUPABASE_KEY}" -H "Authorization: Bearer ${SUPABASE_KEY}" \
+            "${SUPABASE_URL}/rest/v1/supplier_sku?select=count" | jq .
+          echo "stock_current count:"
+          curl -s -H "apikey: ${SUPABASE_KEY}" -H "Authorization: Bearer ${SUPABASE_KEY}" \
+            "${SUPABASE_URL}/rest/v1/stock_current?select=count" | jq .
