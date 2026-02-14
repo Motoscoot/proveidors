@@ -1,63 +1,90 @@
 name: daily-import
+
 on:
-  schedule:
-    - cron: '0 2 * * *'
-  workflow_dispatch:
+schedule:
+- cron: '0 2 * * *'
+workflow_dispatch: {}
 
 jobs:
-  import:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+import:
+runs-on: ubuntu-latest
+steps:
+- name: Checkout repo
+uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+  - name: Set up Python
+    uses: actions/setup-python@v4
+    with:
+      python-version: '3.11'
 
-      - name: Install requirements
-        run: pip install --upgrade pip && pip install -r requirements.txt
+  - name: Install requirements
+    run: pip install --upgrade pip && pip install -r requirements.txt
 
-      - name: Download catalog from Supabase Storage
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          CATALOG_OBJECT: ${{ secrets.CATALOG_OBJECT }}
-        run: |
-          mkdir -p /tmp/catalog
-          echo "Downloading object: ${CATALOG_OBJECT}"
-          curl -s -H "Authorization: Bearer ${SUPABASE_KEY}" -H "apikey: ${SUPABASE_KEY}" \
-            "${SUPABASE_URL}/storage/v1/object/${CATALOG_OBJECT}" -o /tmp/catalog/catalog.zip
-          if [ ! -s /tmp/catalog/catalog.zip ]; then
-            echo "Download failed or empty file"; exit 1
-          fi
-          unzip -p /tmp/catalog/catalog.zip > /tmp/catalog/catalog_inner.json || {
-            unzip /tmp/catalog/catalog.zip -d /tmp/catalog
-            inner=$(find /tmp/catalog -type f -name '*.json' | head -n1)
-            if [ -z "$inner" ]; then echo "No inner JSON found"; exit 1; fi
-            mv "$inner" /tmp/catalog/catalog_inner.json
-          }
+  - name: Download catalog from Supabase Storage
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      CATALOG_OBJECT: ${{ secrets.CATALOG_OBJECT }}
+    run: |
+      set -euo pipefail
+      # debug: muestra sólo si existen las variables, no la clave en claro
+      echo "DBG: SUPABASE_URL='${SUPABASE_URL:-}'"
+      echo "DBG: has SUPABASE_KEY? ${SUPABASE_KEY:+yes:no}"
+      echo "DBG: CATALOG_OBJECT='${CATALOG_OBJECT:-}'"
+      mkdir -p /tmp/catalog
+      echo "Downloading object: ${CATALOG_OBJECT}"
+      # Save headers and body separately; capture HTTP code
+      HTTP_FILE=/tmp/catalog/http_code.txt
+      HDR_FILE=/tmp/catalog/headers.txt
+      BODY_FILE=/tmp/catalog/catalog.zip
+      # Use -L to follow redirects; --silent --show-error for clean logs; write http code to file
+      curl --silent --show-error --write-out "%{http_code}" -D "$HDR_FILE" \
+        -H "Authorization: Bearer ${SUPABASE_KEY}" -H "apikey: ${SUPABASE_KEY}" \
+        "${SUPABASE_URL}/storage/v1/object/${CATALOG_OBJECT}" -o "$BODY_FILE" > "$HTTP_FILE" || rc=$?
+      echo "curl rc=${rc:-0}"
+      echo -n "HTTP code: " && cat "$HTTP_FILE" || true
+      echo "Response headers (first 200 lines):"
+      sed -n '1,200p' "$HDR_FILE" || true
+      echo "Downloaded file size and listing:"
+      ls -l /tmp/catalog || true
+      echo "First 512 bytes (hex):"
+      head -c 512 "$BODY_FILE" | xxd -l 512 || true
+      echo "First 30 lines (text):"
+      head -n 30 "$BODY_FILE" || true
+      # Basic checks
+      if [ ! -s "$BODY_FILE" ]; then
+        echo "Download failed or empty file"
+        exit 1
+      fi
+      # Test if it's a valid zip
+      if unzip -t "$BODY_FILE" >/tmp/catalog/unzip_test.out 2>&1; then
+        echo "ZIP is valid"
+      else
+        echo "unzip test failed, content of /tmp/catalog/unzip_test.out:"
+        sed -n '1,200p' /tmp/catalog/unzip_test.out || true
+        # exit 9 so logs clearly identify this case
+        exit 9
+      fi
 
-      - name: Show sample
-        run: head -n 20 /tmp/catalog/catalog_inner.json || true
+  - name: Show sample
+    run: head -n 20 /tmp/catalog/catalog_inner.json || true
 
-      - name: Run import worker
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          LOCAL_JSON_PATH: /tmp/catalog/catalog_inner.json
-          SUPPLIER_NAME: "BIHR"
-        run: |
-          python3 workers/import_replace.py
+  - name: Run import worker
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      LOCAL_JSON_PATH: /tmp/catalog/catalog_inner.json
+      SUPPLIER_NAME: "BIHR"
+    run: |
+      python3 workers/import_replace.py
 
-      - name: Verify counts (optional)
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: |
-          echo "supplier_sku count:"
-          curl -s -H "apikey: ${SUPABASE_KEY}" -H "Authorization: Bearer ${SUPABASE_KEY}" \
-            "${SUPABASE_URL}/rest/v1/supplier_sku?select=count" | jq .
-          echo "stock_current count:"
-          curl -s -H "apikey: ${SUPABASE_KEY}" -H "Authorization: Bearer ${SUPABASE_KEY}" \
-            "${SUPABASE_URL}/rest/v1/stock_current?select=count" | jq .
+  - name: Verify counts (optional)
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    run: |
+      echo "supplier_sku count:"
+      curl -s -H "apikey: ${SUPABASE_KEY}" -H "Authorization: Bearer ${SUPABASE_KEY}" \
+        "${SUPABASE_URL}/rest/v1/supplier_sku?select=count" | jq .
+      echo "stock_current count:"
+      curl -s -H "apikey: ${SUPABASE_KEY}" -H "Authorization: Bearer ${SUPABASE_KEY}" \
+        "${SUPABASE_URL}/rest/v1/stock_current?select=count" | jq .
